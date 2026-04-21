@@ -1,10 +1,12 @@
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ArrowLeft, ArrowRight, MapPin, Calendar as CalendarIcon, Loader2, AlertCircle, Truck } from 'lucide-react';
+import { ArrowLeft, ArrowRight, MapPin, Calendar as CalendarIcon, Loader2, Clock, AlertCircle, Truck } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Calendar } from '@/components/ui/calendar';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogTrigger } from '@/components/ui/dialog';
 import { format, startOfDay, isBefore, parse, formatISO, startOfMonth, endOfMonth, isValid, addDays, differenceInDays } from 'date-fns';
 import { supabase } from '@/lib/customSupabaseClient';
 import { toast } from '@/components/ui/use-toast';
@@ -14,8 +16,6 @@ import { DeliveryServiceInfo } from '@/components/DeliveryServiceInfo.jsx';
 import { AvailabilityService } from '@/services/AvailabilityService';
 import { UnavailableServiceModal } from '@/components/UnavailableServiceModal';
 import { useDumpFees } from '@/hooks/useDumpFees';
-import { useAvailableTimeSlots } from '@/hooks/useAvailableTimeSlots';
-import { TimePickerDropdown } from '@/components/TimePickerDropdown';
 
 export const BookingForm = ({
   plan,
@@ -30,6 +30,8 @@ export const BookingForm = ({
   const [loadingPlans, setLoadingPlans] = useState(true);
   const [availability, setAvailability] = useState({});
   const [loadingAvailability, setLoadingAvailability] = useState(true);
+  const [fetchingExactTimes, setFetchingExactTimes] = useState(false);
+  const [fetchedPickupWindows, setFetchedPickupWindows] = useState([]);
   const [currentMonth, setCurrentMonth] = useState(startOfMonth(new Date()));
   const [baseRentalPrice, setBaseRentalPrice] = useState(0);
   const [totalPrice, setTotalPrice] = useState(0);
@@ -37,6 +39,7 @@ export const BookingForm = ({
   const [currentMileageRate, setCurrentMileageRate] = useState(0.85);
   const [currentDeliveryFee, setCurrentDeliveryFee] = useState(0);
   const [isServiceTermsExpanded, setIsServiceTermsExpanded] = useState(false);
+  const [trailerRentalHours, setTrailerRentalHours] = useState({ pickupStart: '', returnBy: '' });
   const isDelivery = plan?.id === 2 && deliveryService;
   const { getFeeForService } = useDumpFees();
 
@@ -46,11 +49,18 @@ export const BookingForm = ({
     return allPlans.find(p => p.id === plan?.id) || null;
   }, [isDelivery, allPlans, plan, loadingPlans]);
 
-  const dropOffTimeType = currentPlan?.id === 1 ? 'delivery' : (currentPlan?.id === 2 && !isDelivery ? 'pickup' : (currentPlan?.id === 2 && isDelivery ? 'delivery' : (currentPlan?.id === 3 ? 'delivery' : 'delivery')));
-  const pickupTimeType = currentPlan?.id === 1 ? 'pickup' : (currentPlan?.id === 2 && !isDelivery ? 'return' : (currentPlan?.id === 2 && isDelivery ? 'pickup' : 'pickup'));
-
-  const { timeSlots: dropOffSlots, isLoading: dropOffLoading } = useAvailableTimeSlots(currentPlan?.id || plan?.id, bookingData.dropOffDate, dropOffTimeType);
-  const { timeSlots: pickupSlots, isLoading: pickupLoading } = useAvailableTimeSlots(currentPlan?.id || plan?.id, bookingData.pickupDate, pickupTimeType);
+  // Helper function to format time to "h:mm a" format
+  const formatTimeToAmPm = (timeStr) => {
+    if (!timeStr) return '';
+    try {
+      // Handle HH:mm:ss format from database
+      const parsed = parse(timeStr, 'HH:mm:ss', new Date());
+      return format(parsed, 'h:mm a');
+    } catch (error) {
+      console.warn('Time formatting error:', error);
+      return timeStr; // Return original if parsing fails
+    }
+  };
   
   useEffect(() => {
     const fetchPlans = async () => {
@@ -87,6 +97,72 @@ export const BookingForm = ({
       }));
     }
   }, [isDelivery, setBookingData]);
+
+  // Fetch dynamic rental hours for Dump Loader Trailer Rental (Service ID: 2)
+  useEffect(() => {
+    if (currentPlan?.id !== 2 || isDelivery) return;
+
+    const fetchTrailerRentalHours = async () => {
+      let pickupStart = '';
+      let returnBy = '';
+      const defaultHours = { pickupStart: '8:00 AM', returnBy: '6:00 PM' };
+
+      try {
+        // If a drop-off date is selected, check date_specific_availability first
+        if (bookingData.dropOffDate) {
+          const dateStr = format(bookingData.dropOffDate, 'yyyy-MM-dd');
+          const { data: dsa, error: dsaError } = await supabase
+            .from('date_specific_availability')
+            .select('pickup_start_time, return_by_time')
+            .eq('service_id', 2)
+            .eq('date', dateStr)
+            .maybeSingle();
+
+          if (dsaError) {
+            console.warn('Error fetching date-specific availability:', dsaError);
+          }
+
+          if (dsa?.pickup_start_time) pickupStart = dsa.pickup_start_time;
+          if (dsa?.return_by_time) returnBy = dsa.return_by_time;
+        }
+
+        // Fallback to service_availability if not found in date-specific
+        if (!pickupStart || !returnBy) {
+          const dow = bookingData.dropOffDate ? bookingData.dropOffDate.getDay() : new Date().getDay();
+          const { data: sa, error: saError } = await supabase
+            .from('service_availability')
+            .select('pickup_start_time, return_by_time')
+            .eq('service_id', 2)
+            .eq('day_of_week', dow)
+            .maybeSingle();
+
+          if (saError) {
+            console.warn('Error fetching service availability:', saError);
+          }
+
+          if (sa) {
+            if (!pickupStart && sa.pickup_start_time) pickupStart = sa.pickup_start_time;
+            if (!returnBy && sa.return_by_time) returnBy = sa.return_by_time;
+          } else {
+            console.warn('No service_availability data found for service_id=2, day_of_week=' + dow + '. Using default hours.');
+          }
+        }
+
+        // Set the hours with fallback to defaults
+        setTrailerRentalHours({
+          pickupStart: pickupStart ? formatTimeToAmPm(pickupStart) : defaultHours.pickupStart,
+          returnBy: returnBy ? formatTimeToAmPm(returnBy) : defaultHours.returnBy
+        });
+
+      } catch (error) {
+        console.warn('Unexpected error fetching trailer rental hours:', error);
+        // Use default hours on any error
+        setTrailerRentalHours(defaultHours);
+      }
+    };
+
+    fetchTrailerRentalHours();
+  }, [bookingData.dropOffDate, currentPlan, isDelivery]);
   
   const fetchAvailability = useCallback(async month => {
     if (!plan) return;
@@ -125,6 +201,12 @@ export const BookingForm = ({
             };
           } else {
             mergedAvailability[override.date].available = override.is_available;
+            if (!override.is_available) {
+              mergedAvailability[override.date].deliverySlots = [];
+              mergedAvailability[override.date].pickupSlots = [];
+              mergedAvailability[override.date].returnSlots = [];
+              mergedAvailability[override.date].hourlySlots = [];
+            }
           }
         });
       }
@@ -163,6 +245,183 @@ export const BookingForm = ({
   useEffect(() => {
     fetchAvailability(currentMonth);
   }, [fetchAvailability, currentMonth]);
+
+  // Fetch Exact Times for Dump Loader Trailer Rental (ID: 2)
+  useEffect(() => {
+    if (!currentPlan || currentPlan.id !== 2 || isDelivery) return;
+
+    const fetchExactTimes = async () => {
+      setFetchingExactTimes(true);
+      let pStartTime = '';
+      let rByTime = '';
+      const defaultStart = '8:00 AM';
+      const defaultReturn = '6:00 PM';
+
+      try {
+        if (bookingData.dropOffDate) {
+          const dateStr = format(bookingData.dropOffDate, 'yyyy-MM-dd');
+          const dow = bookingData.dropOffDate.getDay();
+          
+          // Check date-specific availability first
+          const { data: dsa, error: dsaError } = await supabase
+            .from('date_specific_availability')
+            .select('pickup_start_time')
+            .eq('service_id', 2)
+            .eq('date', dateStr)
+            .maybeSingle();
+          
+          if (dsaError) {
+            console.warn('Error fetching date-specific pickup time:', dsaError);
+          }
+          
+          if (dsa?.pickup_start_time) {
+            pStartTime = dsa.pickup_start_time;
+          } else {
+            // Fallback to service_availability
+            const { data: sa, error: saError } = await supabase
+              .from('service_availability')
+              .select('pickup_start_time')
+              .eq('service_id', 2)
+              .eq('day_of_week', dow)
+              .maybeSingle();
+            
+            if (saError) {
+              console.warn('Error fetching service availability pickup time:', saError);
+            }
+            
+            if (sa?.pickup_start_time) {
+              pStartTime = sa.pickup_start_time;
+            } else {
+              console.warn('No pickup_start_time found, using default');
+            }
+          }
+        }
+
+        if (bookingData.pickupDate) {
+          const dateStr = format(bookingData.pickupDate, 'yyyy-MM-dd');
+          const dow = bookingData.pickupDate.getDay();
+          
+          // Check date-specific availability first
+          const { data: dsa, error: dsaError } = await supabase
+            .from('date_specific_availability')
+            .select('return_by_time')
+            .eq('service_id', 2)
+            .eq('date', dateStr)
+            .maybeSingle();
+          
+          if (dsaError) {
+            console.warn('Error fetching date-specific return time:', dsaError);
+          }
+          
+          if (dsa?.return_by_time) {
+            rByTime = dsa.return_by_time;
+          } else {
+            // Fallback to service_availability
+            const { data: sa, error: saError } = await supabase
+              .from('service_availability')
+              .select('return_by_time')
+              .eq('service_id', 2)
+              .eq('day_of_week', dow)
+              .maybeSingle();
+            
+            if (saError) {
+              console.warn('Error fetching service availability return time:', saError);
+            }
+            
+            if (sa?.return_by_time) {
+              rByTime = sa.return_by_time;
+            } else {
+              console.warn('No return_by_time found, using default');
+            }
+          }
+        }
+
+        setBookingData(prev => ({
+          ...prev,
+          dropOffTimeSlot: pStartTime ? formatTimeToAmPm(pStartTime) : defaultStart,
+          pickupTimeSlot: rByTime ? formatTimeToAmPm(rByTime) : defaultReturn
+        }));
+
+      } catch (error) {
+        console.warn('Unexpected error fetching exact times:', error);
+        // Set defaults on error
+        setBookingData(prev => ({
+          ...prev,
+          dropOffTimeSlot: defaultStart,
+          pickupTimeSlot: defaultReturn
+        }));
+      } finally {
+        setFetchingExactTimes(false);
+      }
+    };
+
+    fetchExactTimes();
+  }, [bookingData.dropOffDate, bookingData.pickupDate, currentPlan, isDelivery, setBookingData]);
+  
+  // Fetch Exact Times for Delivery Pickup Window (Service 1 & 4)
+  useEffect(() => {
+    if (!currentPlan || (currentPlan.id !== 1 && currentPlan.id !== 4)) return;
+    
+    const targetDate = bookingData.dropOffDate; 
+    
+    if (!targetDate) {
+        setFetchedPickupWindows([]);
+        return;
+    }
+
+    const fetchPickupWindow = async () => {
+        const dateStr = format(targetDate, 'yyyy-MM-dd');
+        const dow = targetDate.getDay();
+
+        try {
+          // 1. Check date_specific_availability
+          const { data: dsa, error: dsaError } = await supabase
+            .from('date_specific_availability')
+            .select('delivery_pickup_start_time, delivery_pickup_end_time')
+            .eq('service_id', currentPlan.id)
+            .eq('date', dateStr)
+            .maybeSingle();
+
+          if (dsaError) {
+            console.warn('Error fetching date-specific delivery pickup window:', dsaError);
+          }
+
+          let startTime = dsa?.delivery_pickup_start_time;
+          let endTime = dsa?.delivery_pickup_end_time;
+
+          // 2. Fallback to service_availability
+          if (!startTime || !endTime) {
+            const { data: sa, error: saError } = await supabase
+              .from('service_availability')
+              .select('delivery_pickup_window_start_time, delivery_pickup_window_end_time')
+              .eq('service_id', currentPlan.id)
+              .eq('day_of_week', dow)
+              .maybeSingle();
+
+            if (saError) {
+              console.warn('Error fetching service availability delivery pickup window:', saError);
+            }
+
+            startTime = startTime || sa?.delivery_pickup_window_start_time;
+            endTime = endTime || sa?.delivery_pickup_window_end_time;
+          }
+
+          if (startTime && endTime) {
+            const formattedLabel = `${formatTimeToAmPm(startTime)} - ${formatTimeToAmPm(endTime)}`;
+            const rawValue = `${startTime}|${endTime}`;
+            setFetchedPickupWindows([{ label: formattedLabel, value: rawValue }]);
+          } else {
+            console.warn('No delivery pickup window found for service_id=' + currentPlan.id);
+            setFetchedPickupWindows([]);
+          }
+        } catch (error) {
+          console.warn('Unexpected error fetching delivery pickup window:', error);
+          setFetchedPickupWindows([]);
+        }
+    };
+
+    fetchPickupWindow();
+  }, [bookingData.dropOffDate, currentPlan]);
   
   const disabledDates = useMemo(() => {
     const dates = [{
@@ -175,6 +434,41 @@ export const BookingForm = ({
     }
     return dates;
   }, [availability]);
+  
+  const timeSlots = useMemo(() => {
+    if (!currentPlan || !plan) return {
+      dropOff: [],
+      pickup: []
+    };
+    const dropOffDateStr = bookingData.dropOffDate ? format(bookingData.dropOffDate, 'yyyy-MM-dd') : null;
+    const pickupDateStr = bookingData.pickupDate ? format(bookingData.pickupDate, 'yyyy-MM-dd') : null;
+    const dropOffAvail = dropOffDateStr ? availability[dropOffDateStr] : null;
+    const pickupAvail = pickupDateStr ? availability[pickupDateStr] : null;
+    let dropOffSlots = [];
+    let pickupSlots = [];
+    
+    if (dropOffAvail && dropOffAvail.available) {
+      if (plan.id === 1) dropOffSlots = dropOffAvail.deliverySlots || [];
+      else if (plan.id === 2 && !isDelivery) dropOffSlots = dropOffAvail.pickupSlots || [];
+      else if (plan.id === 2 && isDelivery) dropOffSlots = dropOffAvail.deliverySlots || [];
+      else if (plan.id === 3) dropOffSlots = dropOffAvail.deliverySlots || [];
+    }
+    if (pickupAvail && pickupAvail.available) {
+      if (plan.id === 1) pickupSlots = pickupAvail.pickupSlots || [];
+      else if (plan.id === 2 && !isDelivery) pickupSlots = pickupAvail.returnSlots || [];
+      else if (plan.id === 2 && isDelivery) pickupSlots = pickupAvail.pickupSlots || [];
+    }
+    
+    // Apply overriding fetched Delivery Pickup Windows for Service 1 & 4
+    if (currentPlan && (currentPlan.id === 1 || currentPlan.id === 4)) {
+        pickupSlots = fetchedPickupWindows.length > 0 ? fetchedPickupWindows : [];
+    }
+    
+    return {
+      dropOff: dropOffSlots,
+      pickup: pickupSlots
+    };
+  }, [bookingData.dropOffDate, bookingData.pickupDate, availability, currentPlan, plan, isDelivery, fetchedPickupWindows]);
   
   const handleDateSelect = async (field, date) => {
     const newDate = date ? startOfDay(date) : null;
@@ -190,12 +484,15 @@ export const BookingForm = ({
       const state = {
         ...prev,
         [field]: newDate,
-        [`${field.replace('Date', '')}TimeSlot`]: ''
+        // Only clear timeslot if it's NOT service ID 2 (which is auto-populated)
+        ...(currentPlan?.id !== 2 || isDelivery ? { [`${field.replace('Date', '')}TimeSlot`]: '' } : {})
       };
       if (field === 'dropOffDate' && newDate && currentPlan?.id !== 3) {
         if (!prev.pickupDate || isBefore(startOfDay(prev.pickupDate), newDate)) {
           state.pickupDate = newDate;
-          state.pickupTimeSlot = '';
+          if (currentPlan?.id !== 2 || isDelivery) {
+             state.pickupTimeSlot = '';
+          }
         }
       }
       return state;
@@ -258,8 +555,8 @@ export const BookingForm = ({
   
   const isFormValid = useMemo(() => {
     if (!currentPlan) return false;
-    let baseValid = bookingData.dropOffDate && bookingData.dropOffTimeSlot;
-    let pickupValid = currentPlan.id === 3 ? true : bookingData.pickupDate && bookingData.pickupTimeSlot;
+    let baseValid = bookingData.dropOffDate && bookingData.dropOffTimeSlot && bookingData.dropOffTimeSlot !== 'Not available';
+    let pickupValid = currentPlan.id === 3 ? true : (bookingData.pickupDate && bookingData.pickupTimeSlot && bookingData.pickupTimeSlot !== 'Not available');
     const cAddress = bookingData.contactAddress;
     const addressValid = cAddress?.street && cAddress?.city && cAddress?.state && cAddress?.zip;
     return baseValid && pickupValid && addressValid;
@@ -270,7 +567,7 @@ export const BookingForm = ({
     if (!isFormValid) {
       toast({
         title: "Incomplete Form",
-        description: "Please ensure all required fields are filled to proceed.",
+        description: "Please ensure all required fields are filled and valid times are selected to proceed.",
         variant: "destructive"
       });
       return;
@@ -312,33 +609,39 @@ export const BookingForm = ({
   const getFieldLabels = () => {
     if (!currentPlan || !plan) return {
       date1: 'Date',
-      date2: 'Date'
+      date2: 'Date',
+      time1: 'Time',
+      time2: 'Time'
     };
     switch (isDelivery ? 4 : plan.id) {
       case 1:
+      case 4:
         return {
           date1: 'Delivery Date',
-          date2: 'Pickup Date'
+          date2: 'Delivery Pickup Date',
+          time1: 'Delivery (Time Window)',
+          time2: 'Delivery (Pickup Window)'
         };
       case 2:
         return {
           date1: 'Pickup Date',
-          date2: 'Return Date'
+          date2: 'Return Date',
+          time1: 'Pickup Start Time',
+          time2: 'Return by Time'
         };
       case 3:
         return {
           date1: 'Delivery Date',
-          date2: ''
-        };
-      case 4:
-        return {
-          date1: 'Drop-off Date',
-          date2: 'Pickup Date'
+          date2: '',
+          time1: 'Delivery (Time Window)',
+          time2: ''
         };
       default:
         return {
           date1: 'Start Date',
-          date2: 'End Date'
+          date2: 'End Date',
+          time1: 'Start Time',
+          time2: 'End Time'
         };
     }
   };
@@ -350,6 +653,7 @@ export const BookingForm = ({
   if (loadingPlans || !plan) return <div className="flex justify-center items-center h-96"><Loader2 className="h-16 w-16 animate-spin text-yellow-400" /></div>;
 
   const planName = currentPlan?.name || plan?.name || 'Selected Service';
+  const labels = getFieldLabels();
   
   const renderDescription = () => {
     const dumpFeeData = getFeeForService(currentPlan?.id);
@@ -360,15 +664,66 @@ export const BookingForm = ({
       return (
         <div className="text-blue-200 mb-6 space-y-4 text-sm leading-relaxed">
           <p>
-            Experience the ultimate convenience with our Dump Trailer Delivery & Removal Service.
+            Experience the ultimate convenience with our Dump Trailer Delivery & Removal Service. Perfect for residential or commercial projects, this service eliminates the need for you to own a towing vehicle.
           </p>
+          <div>
+            <h4 className="font-bold text-white mb-1">Our Service Process</h4>
+            <p>
+              Our standard rental is optimized for short-term projects, providing a seamless, "no-contact" experience. We offer early morning drop-offs between 6:00 AM and 8:00 AM, placing the trailer at your property's street curb. You will have the entire day to load the bin at your own pace. We return the following morning during the same window to haul it away.
+            </p>
+            <p className="mt-2">
+              For your convenience, we handle both drop-off and pick-up remotely—there is no need for you to be present. To further streamline your workflow, we also offer additional equipment rentals to help you work more efficiently.
+            </p>
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <h4 className="font-bold text-white text-base">Service Terms</h4>
+              <span 
+                onClick={toggleServiceTerms}
+                className="text-blue-400 hover:text-blue-300 cursor-pointer text-sm font-medium transition-colors"
+              >
+                {isServiceTermsExpanded ? 'see less' : 'see more'}
+              </span>
+            </div>
+            <AnimatePresence>
+              {isServiceTermsExpanded && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="overflow-hidden"
+                >
+                  <div className="mt-2">
+                    <h5 className="font-bold text-blue-100">Site Accessibility & Parking</h5>
+                    <p>
+                      Customers are responsible for ensuring a clear, accessible parking space is available at the street curb directly in front of the property. This space must be cleared prior to our arrival and remain available for our return the following morning. Our trucks require ample room to maneuver for both drop-off and retrieval; if we are unable to access the site, a dry-run fee may be imposed. Please ensure there is sufficient clearance for the driver to operate safely.
+                    </p>
+                  </div>
+                  <div className="mt-2">
+                    <h5 className="font-bold text-blue-100">Permits & Compliance</h5>
+                    <p>
+                      Customers are responsible for obtaining any necessary street-side parking permits and adhering to all local city ordinances. Any fines resulting from improper placement, lack of permits, or overloading are the sole responsibility of the client.
+                    </p>
+                  </div>
+                  <div className="mt-2">
+                    <h5 className="font-bold text-blue-100">Disposal Fees</h5>
+                    <p>
+                      Disposal fees are charged per ton. These charges will be applied to the card on file once the rental is complete and the load has been processed at the landfill.
+                    </p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
           <div className="bg-black/20 p-3 rounded border border-blue-500/20">
             <p className="font-bold text-white mb-1">Fee Structure:</p>
             <ul className="list-disc list-inside space-y-1">
-              <li>Rental: Base rate per day</li>
+              <li>Rental: Base rate per day (calculated below)</li>
               {currentDeliveryFee > 0 && <li>Base Delivery Fee: <span className="text-green-400">${currentDeliveryFee.toFixed(2)}</span></li>}
-              <li>Mileage Charge: Distance-based calculation</li>
+              <li>Mileage Charge: Distance-based calculation from our lot</li>
               <li>Dump Fees: <span className="text-green-400">${dynamicFee} per ton</span></li>
+              <li>Weight Limit: <span className="text-orange-400">{dynamicMaxTons || 2.5}-ton maximum capacity</span></li>
             </ul>
           </div>
         </div>
@@ -379,14 +734,14 @@ export const BookingForm = ({
       return (
          <div className="text-blue-200 mb-6 space-y-3 text-sm leading-relaxed">
           <p>
-            Our <strong>16 Yard Dumpster Rental</strong> is perfect for mid-to-large cleanouts.
+            Our <strong>16 Yard Dumpster Rental</strong> is perfect for mid-to-large cleanouts, remodeling projects, and construction debris.
           </p>
           <div className="bg-black/20 p-3 rounded border border-blue-500/20 mt-4">
             <p className="font-bold text-white mb-1">Pricing Details:</p>
             <ul className="list-disc list-inside space-y-1">
               <li>Rental: Base rate covers up to 7 days</li>
               {currentDeliveryFee > 0 && <li>Base Delivery Fee: <span className="text-green-400">${currentDeliveryFee.toFixed(2)}</span></li>}
-              <li>Dump Fees: <span className="text-green-400">${dynamicFee} per ton</span></li>
+              <li>Dump Fees: <span className="text-green-400">${dynamicFee} per ton {dynamicMaxTons ? `(${dynamicMaxTons} tons max)` : ''}</span></li>
             </ul>
           </div>
         </div>
@@ -394,11 +749,88 @@ export const BookingForm = ({
     }
 
     if (currentPlan?.id === 2) {
+      const rentalHoursText = trailerRentalHours.pickupStart && trailerRentalHours.returnBy 
+        ? `gives you the trailer from ${trailerRentalHours.pickupStart} to ${trailerRentalHours.returnBy}.`
+        : 'gives you the trailer for a full rental day.';
+
       return (
-        <div className="text-blue-200 mb-6 space-y-3 text-sm leading-relaxed">
+        <div className="text-blue-200 mb-6 space-y-4 text-sm leading-relaxed">
           <p>
-            Our <strong>Dump Loader Trailer Rental</strong> is the heavy-duty solution.
+            Our <strong>Dump Loader Trailer Rental</strong> is the heavy-duty solution for DIYers and professionals alike. This versatile 16'x7'x4' trailer empowers you to move materials on your own schedule—saving you time, money, and the hassle of multiple trips.
           </p>
+          
+          <div>
+            <h4 className="font-bold text-white text-base mb-2">Key Capabilities:</h4>
+            <ul className="space-y-1.5 ml-1">
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">Bulk Material Hauling:</strong> Perfect for picking up bark, gravel, or aggregate directly from the supplier. Transport high-volume loads in a single trip and dump them exactly where you need them.</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">Versatile Disposal:</strong> Built for landscape debris, junk removal, construction waste, and remodel demolition.</span>
+              </li>
+            </ul>
+          </div>
+
+          <div>
+            <h4 className="font-bold text-white text-base mb-2">Self-Service Flexibility & Maximum Value:</h4>
+            <ul className="space-y-1.5 ml-1">
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">Contactless Pickup & Return:</strong> Your receipt includes the address and access instructions. No need to coordinate a meeting time—simply arrive, hook up, and go.</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">The Longest Rental Window:</strong> We offer some of the most generous rental hours in the industry, giving you a true full day's work without unnecessary restrictions. While other companies shorten your time or charge extra for full-day access, our flat daily rate {rentalHoursText}</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">Your Schedule:</strong> Pick up as early or return as late as you need within our operating window for one consistent, transparent price.</span>
+              </li>
+            </ul>
+          </div>
+
+          <div>
+            <h4 className="font-bold text-white text-base mb-2">Rental & Safety Requirements:</h4>
+            <ul className="space-y-1.5 ml-1">
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">Rental Terms:</strong> Multi-day rentals are available for larger projects requiring extended haul time. See below for current daily rates.</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-yellow-400 mr-2 mt-0.5">•</span>
+                <span><strong className="text-white">Hitch Requirements:</strong> Your vehicle MUST be equipped with a <span className="text-yellow-400 font-semibold">2-5/16" ball hitch</span> and a standard 7-way electrical connector. You are responsible for a safety self-inspection upon hookup to ensure a secure connection.</span>
+              </li>
+            </ul>
+          </div>
+
+          <div>
+            <h4 className="font-bold text-white text-base mb-2">Location:</h4>
+            <p className="ml-1">Pick up is located on the South Side of Saratoga Springs.</p>
+          </div>
+
+          <div className="bg-black/20 p-3 rounded border border-blue-500/20">
+            <p className="font-bold text-white mb-2">Rental Includes:</p>
+            <ul className="space-y-1">
+              <li className="flex items-start">
+                <span className="text-green-400 mr-2 mt-0.5">•</span>
+                <span>Wireless Remote Control for easy dumping operation</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-green-400 mr-2 mt-0.5">•</span>
+                <span>Integrated Power Tarp Cover to secure your load</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-green-400 mr-2 mt-0.5">•</span>
+                <span>Hydraulic Jack for effortless coupling and uncoupling</span>
+              </li>
+              <li className="flex items-start">
+                <span className="text-green-400 mr-2 mt-0.5">•</span>
+                <span>Weight Limit: 5-ton capacity</span>
+              </li>
+            </ul>
+          </div>
         </div>
       );
     }
@@ -407,7 +839,16 @@ export const BookingForm = ({
   };
   
   return <>
-    <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -50 }} className="container mx-auto pt-8 pb-16 px-4">
+    <motion.div initial={{
+      opacity: 0,
+      y: 50
+    }} animate={{
+      opacity: 1,
+      y: 0
+    }} exit={{
+      opacity: 0,
+      y: -50
+    }} className="container mx-auto pt-8 pb-16 px-4">
       <div className="max-w-4xl mx-auto bg-white/10 backdrop-blur-lg rounded-2xl p-8 shadow-2xl border border-white/20">
         
         <div className="flex items-center mb-8 border-b border-white/10 pb-4">
@@ -423,18 +864,89 @@ export const BookingForm = ({
           <div className="bg-white/5 p-6 rounded-lg h-fit border border-white/5">
             <div className="flex items-center mb-4">
               <h3 className="text-2xl font-bold text-yellow-400">{planName}</h3>
+              {plan?.id === 2 && !isDelivery && (
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <AlertCircle className="h-6 w-6 ml-2 text-yellow-500 cursor-pointer animate-pulse transition-transform hover:scale-110" />
+                  </DialogTrigger>
+                  <DialogContent 
+                    className="!top-[25vh] !translate-y-0 !left-[50%] !translate-x-[-50%] w-[90vw] max-w-[450px] max-h-[60vh] overflow-y-auto bg-gray-900 border-2 border-orange-500 p-5 shadow-2xl shadow-orange-900/40 z-[9999] text-white"
+                  >
+                    <div className="flex items-center space-x-2 mb-4 border-b border-orange-500/30 pb-3">
+                      <AlertCircle className="h-6 w-6 text-orange-500 flex-shrink-0" />
+                      <span className="font-bold text-orange-400 text-base uppercase tracking-wide">Liability & Responsibility</span>
+                    </div>
+                    <ul className="space-y-4 text-sm text-gray-300">
+                      <li>
+                        <strong className="text-white block mb-1">Vehicle & Towing Requirements:</strong>
+                        Renter must ensure their vehicle meets the necessary towing capacity. Valid driver's license and proof of insurance are required.
+                      </li>
+                      <li>
+                        <strong className="text-white block mb-1">Damage & Improper Use:</strong>
+                        Renter is fully responsible for any trailer damage, overloading, or improper loading occurring during the rental period.
+                      </li>
+                      <li>
+                        <strong className="text-white block mb-1">Cleaning & Maintenance:</strong>
+                        The trailer must be returned completely empty and reasonably clean. Failure to do so will result in additional dump and cleaning fees.
+                      </li>
+                      <li>
+                        <strong className="text-white block mb-1">Insurance & Legal Compliance:</strong>
+                        Renter is fully liable for all traffic violations, accidents, and must comply with all local towing laws and regulations.
+                      </li>
+                      <li>
+                        <strong className="text-white block mb-1">Assumption of Risk:</strong>
+                        By renting, the customer assumes all risks associated with towing and operating the dump trailer.
+                      </li>
+                    </ul>
+                  </DialogContent>
+                </Dialog>
+              )}
+              {currentPlan?.id === 4 && (
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <AlertCircle className="h-6 w-6 ml-2 text-yellow-500 cursor-pointer animate-pulse transition-transform hover:scale-110" />
+                  </DialogTrigger>
+                  <DialogContent 
+                    className="!top-[25vh] !translate-y-0 !left-[50%] !translate-x-[-50%] w-[90vw] max-w-[450px] max-h-[60vh] overflow-y-auto bg-gray-900 border-2 border-orange-500 p-5 shadow-2xl shadow-orange-900/40 z-[9999] text-white"
+                  >
+                    <div className="flex items-center space-x-2 mb-4 border-b border-orange-500/30 pb-3">
+                      <AlertCircle className="h-6 w-6 text-orange-500 flex-shrink-0" />
+                      <span className="font-bold text-orange-400 text-base uppercase tracking-wide">Prohibited Materials</span>
+                    </div>
+                    <p className="text-sm text-gray-300 leading-relaxed">
+                      <strong className="text-white">CAUTION:</strong> These Materials are not allowed in the dumpster. Prohibited items include hazardous materials (paint, chemicals, asbestos), tires, and batteries. Mattresses and TVs can be taken to the dump, but they require an extra $25 for each mattress and $15 for each TV. Please refer to our user agreement for a complete list of restricted items. Disposing of these items in the dumpster may result in additional fees.
+                    </p>
+                  </DialogContent>
+                </Dialog>
+              )}
             </div>
             {renderDescription()}
             <div className="border-t border-white/20 pt-4">
-              <p className="text-white text-lg font-semibold">Estimated Price (Rental + Base Delivery Fee):</p>
+              <p className="text-white text-lg font-semibold">
+                {currentPlan?.id === 2 && !isDelivery ? 'Projected Total (For Days Booked):' : 'Estimated Price (Rental + Base Delivery Fee):'}
+              </p>
               <div className="flex items-baseline mb-2">
                 <p className="text-4xl font-bold text-green-400">${totalPrice.toFixed(2)}</p>
+                <span className="text-sm text-blue-200 ml-2">(plus tax)</span>
               </div>
+              <div className="text-sm text-gray-300 mb-2">
+                 <span>Base Rental: ${baseRentalPrice.toFixed(2)}</span>
+                 {currentDeliveryFee > 0 && <span className="ml-4">Delivery Fee: ${currentDeliveryFee.toFixed(2)}</span>}
+              </div>
+              {(isDelivery || plan?.id === 1) && <p className="text-xs text-yellow-300 italic flex items-center mt-2">
+                   <Truck className="h-4 w-4 mr-1" /> Mileage charge will be calculated in the next step based on distance.
+                </p>}
             </div>
           </div>
 
           <form onSubmit={handleFormSubmit} className="space-y-6">
-            <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="space-y-4">
+            <motion.div initial={{
+              opacity: 0,
+              x: 20
+            }} animate={{
+              opacity: 1,
+              x: 0
+            }} className="space-y-4">
               {plan?.id === 2 && <div className="flex items-center space-x-3 mb-6 bg-white/10 p-4 rounded-lg border border-yellow-500/30">
                     <Checkbox id="deliveryService" checked={deliveryService} onCheckedChange={setDeliveryService} className="border-yellow-400 data-[state=checked]:bg-yellow-400" />
                     <label htmlFor="deliveryService" className="text-sm font-semibold text-white cursor-pointer flex-1">
@@ -453,48 +965,74 @@ export const BookingForm = ({
                         value={bookingData.contactAddress?.street || ''} 
                         onChange={val => setBookingData(prev => ({
                             ...prev,
-                            contactAddress: { ...prev.contactAddress, street: val, isVerified: false, unverifiedAccepted: true }
+                            contactAddress: {
+                              ...prev.contactAddress,
+                              street: val,
+                              isVerified: false,
+                              unverifiedAccepted: true
+                            }
                         }))} 
                         onAddressSelect={details => setBookingData(prev => ({
                             ...prev,
-                            contactAddress: { ...prev.contactAddress, isVerified: true, unverifiedAccepted: false, ...details }
+                            contactAddress: {
+                              ...prev.contactAddress,
+                              isVerified: true,
+                              unverifiedAccepted: false,
+                              ...details,
+                            }
                         }))} 
                         placeholder="Start typing your address..." 
                         required 
                       />
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      <InputField icon={<MapPin />} value={bookingData.contactAddress?.city || ''} onChange={(e) => handleManualAddressChange('city', e.target.value)} placeholder="City" />
-                      <InputField icon={<MapPin />} value={bookingData.contactAddress?.state || ''} onChange={(e) => handleManualAddressChange('state', e.target.value)} placeholder="State" />
-                      <InputField icon={<MapPin />} value={bookingData.contactAddress?.zip || ''} onChange={(e) => handleManualAddressChange('zip', e.target.value)} placeholder="ZIP" />
+                      <InputField 
+                        icon={<MapPin />} 
+                        value={bookingData.contactAddress?.city || ''} 
+                        onChange={(e) => handleManualAddressChange('city', e.target.value)}
+                        placeholder="City" 
+                      />
+                      <InputField 
+                        icon={<MapPin />} 
+                        value={bookingData.contactAddress?.state || ''} 
+                        onChange={(e) => handleManualAddressChange('state', e.target.value)}
+                        placeholder="State" 
+                      />
+                      <InputField 
+                        icon={<MapPin />} 
+                        value={bookingData.contactAddress?.zip || ''} 
+                        onChange={(e) => handleManualAddressChange('zip', e.target.value)}
+                        placeholder="ZIP" 
+                      />
                   </div>
+                  {!bookingData.contactAddress?.isVerified && bookingData.contactAddress?.street && (
+                      <p className="text-xs text-orange-300 bg-orange-900/20 p-2 rounded border border-orange-500/30 mt-2">
+                          Important: Please log in to the customer portal as soon as your order is placed. This allows you to verify your details and ensure your order processes as quickly as possible.
+                      </p>
+                  )}
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6 border-t border-white/10 pt-4">
-                  <DatePickerField label={getFieldLabels().date1} date={bookingData.dropOffDate} setDate={d => handleDateSelect('dropOffDate', d)} disabledDates={disabledDates} onMonthChange={setCurrentMonth} />
-                  <div className="md:col-span-1">
-                    <label className="text-sm font-medium text-white mb-2 block">Time</label>
-                    <TimePickerDropdown 
-                      selectedTime={bookingData.dropOffTimeSlot} 
-                      onTimeChange={v => setBookingData(p => ({ ...p, dropOffTimeSlot: v }))} 
-                      timeSlots={dropOffSlots} 
-                      disabled={!bookingData.dropOffDate} 
-                      isLoading={dropOffLoading || loadingAvailability} 
-                    />
-                  </div>
+                  <DatePickerField label={labels.date1} date={bookingData.dropOffDate} setDate={d => handleDateSelect('dropOffDate', d)} disabledDates={disabledDates} onMonthChange={setCurrentMonth} />
+                  {currentPlan?.id === 2 && !isDelivery ? (
+                      <ReadOnlyTimeField label={labels.time1} value={bookingData.dropOffTimeSlot} loading={fetchingExactTimes} />
+                  ) : (
+                      <TimeSlotPicker label={labels.time1} value={bookingData.dropOffTimeSlot} onValueChange={v => setBookingData(p => ({
+                        ...p,
+                        dropOffTimeSlot: v
+                      }))} slots={timeSlots.dropOff} disabled={!bookingData.dropOffDate} loading={loadingAvailability} />
+                  )}
                   
                   {currentPlan?.id !== 3 && <>
-                          <DatePickerField label={getFieldLabels().date2} date={bookingData.pickupDate} setDate={d => handleDateSelect('pickupDate', d)} disabledDates={disabledDates} onMonthChange={setCurrentMonth} />
-                          <div className="md:col-span-1">
-                            <label className="text-sm font-medium text-white mb-2 block">Time</label>
-                            <TimePickerDropdown 
-                              selectedTime={bookingData.pickupTimeSlot} 
-                              onTimeChange={v => setBookingData(p => ({ ...p, pickupTimeSlot: v }))} 
-                              timeSlots={pickupSlots} 
-                              disabled={!bookingData.pickupDate} 
-                              isLoading={pickupLoading || loadingAvailability} 
-                            />
-                          </div>
+                          <DatePickerField label={labels.date2} date={bookingData.pickupDate} setDate={d => handleDateSelect('pickupDate', d)} disabledDates={disabledDates} onMonthChange={setCurrentMonth} />
+                          {currentPlan?.id === 2 && !isDelivery ? (
+                              <ReadOnlyTimeField label={labels.time2} value={bookingData.pickupTimeSlot} loading={fetchingExactTimes} />
+                          ) : (
+                              <TimeSlotPicker label={labels.time2} value={bookingData.pickupTimeSlot} onValueChange={v => setBookingData(p => ({
+                                ...p,
+                                pickupTimeSlot: v
+                              }))} slots={timeSlots.pickup} disabled={!bookingData.pickupDate} loading={loadingAvailability} />
+                          )}
                       </>}
               </div>
               
@@ -511,15 +1049,70 @@ export const BookingForm = ({
   </>;
 };
 
-const InputField = ({ icon, disabled, ...props }) => <div className="relative flex items-center">
+const InputField = ({
+  icon,
+  disabled,
+  ...props
+}) => <div className="relative flex items-center">
     <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-blue-300">{icon}</span>
     <input {...props} disabled={disabled} className={`w-full bg-white/10 text-white rounded-lg border border-white/30 focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 pl-9 pr-4 py-2 text-sm placeholder-blue-200 transition-colors ${disabled ? 'opacity-60 bg-gray-800 cursor-not-allowed' : ''}`} />
   </div>;
 
-const DatePickerField = ({ label, date, setDate, disabledDates, onMonthChange }) => <div className="md:col-span-1">
+const DatePickerField = ({
+  label,
+  date,
+  setDate,
+  disabledDates,
+  onMonthChange
+}) => <div className="md:col-span-1">
     <label className="text-sm font-medium text-white mb-2 block">{label}</label>
     <Popover>
       <PopoverTrigger asChild><Button variant="outline" className="w-full justify-start text-left font-normal bg-white/10 border-white/30 hover:bg-white/20 text-white"><CalendarIcon className="mr-2 h-4 w-4" />{date ? format(date, 'PPP') : <span>Pick a date</span>}</Button></PopoverTrigger>
       <PopoverContent className="w-auto p-0 bg-gray-800 border-gray-700 text-white"><Calendar mode="single" selected={date} onSelect={setDate} disabled={disabledDates} initialFocus onMonthChange={onMonthChange} /></PopoverContent>
     </Popover>
   </div>;
+
+const TimeSlotPicker = ({
+  label,
+  value,
+  onValueChange,
+  slots,
+  disabled,
+  loading
+}) => <div className="md:col-span-1">
+    <label className="text-sm font-medium text-white mb-2 block">{label}</label>
+    <Select onValueChange={onValueChange} value={value} disabled={disabled || loading}>
+      <SelectTrigger className="w-full bg-white/10 border-white/30 text-white"><Clock className="mr-2 h-4 w-4" /><SelectValue placeholder="Select a time" /></SelectTrigger>
+      <SelectContent className="bg-gray-800 border-gray-700 text-white">
+        {loading ? <SelectItem value="loading" disabled>Loading...</SelectItem> : slots?.length > 0 ? slots.map(slot => <SelectItem key={slot.value} value={slot.value}>{slot.label || slot.value}</SelectItem>) : <SelectItem value="no-slots" disabled>None</SelectItem>}
+      </SelectContent>
+    </Select>
+  </div>;
+
+const ReadOnlyTimeField = ({ label, value, loading }) => {
+  const formatTimeToAmPm = (timeStr) => {
+    if (!timeStr || timeStr === 'Not available') return timeStr;
+    try {
+      const parsed = parse(timeStr, 'HH:mm:ss', new Date());
+      return format(parsed, 'h:mm a');
+    } catch {
+      // If already formatted or invalid, return as-is
+      return timeStr;
+    }
+  };
+
+  const displayValue = loading ? 'Loading...' : (value ? formatTimeToAmPm(value) : 'Pending...');
+      
+  return (
+      <div className="md:col-span-1">
+          <label className="text-sm font-medium text-white mb-2 block">{label}</label>
+          <div className={`w-full bg-black/40 border border-white/20 rounded-md px-3 py-2 flex items-center cursor-not-allowed text-sm h-10 ${value === 'Not available' ? 'text-red-400 font-semibold' : 'text-gray-300'}`}>
+              {loading ? (
+                 <><Loader2 className="mr-2 h-4 w-4 animate-spin text-gray-500" /> Loading...</>
+              ) : (
+                 <><Clock className={`mr-2 h-4 w-4 ${value === 'Not available' ? 'text-red-400' : 'text-gray-500'}`} /> {displayValue}</>
+              )}
+          </div>
+      </div>
+  );
+};
